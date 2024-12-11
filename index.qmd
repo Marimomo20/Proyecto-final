@@ -1,0 +1,573 @@
+---
+title: "Proyecto final de programación en R: Modelo de nicho actual y futuro de la especie Rhinoderma darwinii"
+author: Mariana de los Ángeles Morales Morales
+format:
+  html:
+    toc: true
+    toc_float: true
+    theme: minty
+---
+
+La *Ranita de Darwin* (Rhinoderma darwinii) es una especie endémica de Chile y Argentina, conocida por su particular comportamiento de incubación en el saco vocal del macho. Esta especie se enfrenta a una amenaza creciente debido al **cambio climático**, que altera los ecosistemas acuáticos y afecta su capacidad de reproducción. Las altas temperaturas y las variaciones en los patrones de precipitación pueden tener un impacto directo en la disponibilidad de su hábitat y en su proceso reproductivo.
+
+![Rana de Darwin](https://wwflac.awsassets.panda.org/img/ranita_de_darwin__cayetano_espinosa_wwf_chile_755678.jpg)
+
+
+Para el modelado de nicho se consideró una resolución de 10 km y el escenario climático SSP 585 con el modelo HadGEM3-GC31-LL. Se utilizó el 70% de los datos de presencia para entrenamiento, descargados de GBIF. Con paquetes como sf, terra, dismo y leaflet, se procesaron los datos, entrenó el modelo MaxEnt y se generaron mapas interactivos.
+
+
+
+# Parámetros generales para el modelo
+
+```{r}
+#| label: parametros
+#| message: false
+#| warning: false
+
+# Nombre de la especie
+especie <- "Rhinoderma darwinii Duméril & Bibron, 1841"
+
+# Desplazamiento (offset) para delimitar el área de estudio
+desplazamiento = 5
+
+# Resolución espacial de los datos climáticos
+resolucion = 10
+
+# SSP
+ssp <- "585"            #Se puede cambiar por el escenario "126"
+
+# GCM
+gcm <- "HadGEM3-GC31-LL"
+
+# Proporción de datos de entreamiento a utilizar en el modelo
+proporcion_entrenamiento = 0.7
+```
+
+# Carga de paquetes
+
+```{r}
+#| label: paquetes
+#| message: false
+#| warning: false
+
+# Colección de paquetes de Tidyverse
+library(tidyverse)
+
+# Estilos para ggplot2
+library(ggthemes)
+
+# Paletas de colores de RColorBrewer
+library(RColorBrewer)
+
+# Paletas de colores de viridis
+library(viridisLite)
+
+# Gráficos interactivos
+library(plotly)
+
+# Manejo de datos vectoriales
+library(sf)
+
+# Manejo de datos raster
+library(terra)
+
+# Manejo de datos raster
+library(raster)
+
+# Mapas interactivos
+library(leaflet)
+
+# Acceso a datos en GBIF
+library(rgbif)
+
+# Acceso a datos climáticos
+library(geodata)
+
+# Modelado de distribución de especies
+library(dismo)
+
+library("rJava")
+```
+
+# Obtención de datos de presencia
+
+```{r}
+#| label: datos
+#| message: false
+#| warning: false
+
+# Consultar el API de GBIF
+respuesta <- occ_search(
+  scientificName = especie, 
+  hasCoordinate = TRUE,
+  hasGeospatialIssue = FALSE,
+  limit = 10000
+)
+
+# Extraer datos de presencia
+presencia <- respuesta$data
+```
+
+```{r}
+#| label: guardado de archivo
+#| message: false
+#| warning: false
+
+# Guardar los datos de presencia en un archivo CSV
+write_csv(presencia, 'presencia.csv')
+```
+
+```{r}
+#| label: lectura
+#| message: false
+#| warning: false
+
+# Leer en un dataframe los datos de presencia de un archivo CSV
+presencia <- read_csv('presencia.csv')
+
+# Crear un objeto sf a partir del dataframe
+presencia <- st_as_sf(
+  presencia,
+  coords = c("decimalLongitude", "decimalLatitude"),
+  remove = FALSE, # conservar las columnas de las coordenadas
+  crs = 4326
+)
+```
+
+# Delimitación del área de estudio
+
+```{r}
+#| label: delimitacion
+#| message: false
+#| warning: false
+
+# Delimitar la extensión del área de estudio
+area_estudio <- ext(
+  min(presencia$decimalLongitude) - desplazamiento, 
+  max(presencia$decimalLongitude) + desplazamiento,
+  min(presencia$decimalLatitude) - desplazamiento, 
+  max(presencia$decimalLatitude) + desplazamiento
+)
+```
+
+# Obtención de datos de clima actual
+
+```{r}
+#| label: datos actuales
+#| message: false
+#| warning: false
+
+# Obtener datos climáticos actuales
+clima_actual <- worldclim_global(
+  var = 'bio', 
+  res = resolucion, 
+  path = tempdir()
+)
+
+# Recortar los datos climáticos para el área de estudio
+clima_actual <- crop(clima_actual, area_estudio)
+
+# Desplegar nombres de las variables climáticas
+names(clima_actual)
+```
+
+# Obtención de datos de clima futuro
+
+```{r}
+#| label: datos futuros
+#| message: false
+#| warning: false
+
+# Obtener datos climáticos para escenario futuro
+clima_futuro <- cmip6_world(
+  var = "bioc",
+  res = resolucion,
+  ssp = ssp,
+  model = gcm,
+  time = "2041-2060",
+  path = tempdir()
+)
+
+# Recortar los datos climáticos para el área de estudio
+clima_futuro <- crop(clima_futuro, area_estudio)
+
+# Desplegar nombres de las variables
+names(clima_futuro)
+```
+
+# Creación de conjuntos de entrenamiento y de evaluación
+
+```{r}
+#| label: entrenamiento
+#| message: false
+#| warning: false
+
+# Crear dataframe con columnas de longitud y latitud
+coordenadas_presencia <- data.frame(
+  decimalLongitude = presencia$decimalLongitude,
+  decimalLatitude = presencia$decimalLatitude
+)
+
+# Eliminar coordenadas duplicadas
+coordenadas_presencia <- unique(coordenadas_presencia)
+```
+
+```{r}
+#| label: semilla
+#| message: false
+#| warning: false
+
+# Establecer una "semilla" para garantizar que la selección aleatoria sea reproducible
+set.seed(123)
+
+# Cantidad de registros de presencia
+n_presencia <- nrow(coordenadas_presencia)
+
+# Con sample(), se selecciona aleatoriamente una proporción (ej. 0.7) 
+# de los índices de los datos de presencia para el conjunto de entrenamiento
+indices_entrenamiento <- sample(
+  1:n_presencia, 
+  size = round(proporcion_entrenamiento * n_presencia)
+)
+
+# Crear el subconjunto de entrenamiento utilizando los índices seleccionados
+entrenamiento <- coordenadas_presencia[indices_entrenamiento, ]
+
+# Crear el subconjunto de evaluación con los datos restantes
+evaluacion <- coordenadas_presencia[-indices_entrenamiento, ]
+```
+
+# Instalación de java en
+
+https://www.oracle.com/java/technologies/downloads/?er=221886 install.packages("rJava") library(rJava)
+
+# Modelo con clima actual
+
+```{r}
+#| label: conversion raster
+#| message: false
+#| warning: false
+
+# Los datos de clima deben convertirse al formato que usa el paquete raster
+# debido a es este el que acepta el paquete dismo
+clima_actual <- raster::stack(clima_actual)
+
+# Generar el modelo
+modelo_actual <- maxent(x = clima_actual, p = entrenamiento)
+
+# Aplicar el modelo entrenado al clima actual
+prediccion_actual <- predict(modelo_actual, clima_actual)
+```
+
+```{r}
+#| label: estadisticas
+#| message: false
+#| warning: false
+
+# terra::extract() extrae los valores del raster de predicción 
+# en las coordenadas de evaluación
+# eval_pres almacena los valores de idoneidad predichos 
+# en los puntos de evaluación de presencia
+
+  eval_pres <- terra::extract(
+  prediccion_actual, 
+  evaluacion[, c('decimalLongitude', 'decimalLatitude')]
+)
+
+# Generar puntos aleatorios dentro del área de estudio definida. 
+# Estos puntos se asumen como ausencias de la especie.
+ausencias <- randomPoints(mask = clima_actual, n = 1000)
+
+# eval_aus almacena los valores de idoneidad predichos
+# en los puntos de ausencia
+eval_aus <- terra::extract(
+  prediccion_actual, 
+  ausencias
+)
+
+# Generar estadísticas de evaluación del modelo
+resultado_evaluacion <- evaluate(p = eval_pres, a = eval_aus)
+```
+
+# Curva ROC y AUC para el modelo de clima actual
+
+```{r}
+#| label: ROC y AUC
+#| message: false
+#| warning: false
+
+# Datos para graficar la curva ROC
+datos_roc <- data.frame(
+  FPR = resultado_evaluacion@FPR,
+  TPR = resultado_evaluacion@TPR,
+  Umbral = resultado_evaluacion@t
+)
+
+# Valor AUC
+auc <- resultado_evaluacion@auc
+
+# Gráfico ggplot2
+grafico_ggplot2 <-
+  ggplot(
+    datos_roc, 
+    aes(
+      x = FPR, 
+      y = TPR,
+      u = Umbral
+    )
+  ) +
+  geom_line(
+    color = "blue", 
+    size = 1
+  ) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  labs(title = paste("Curva ROC (AUC =", round(auc, 3), ")"),
+       x = "Tasa de falsos positivos (FPR)",
+       y = "Tasa de verdaderos positivos (TPR)") +
+  theme_minimal()
+
+# Gráfico plotly
+ggplotly(grafico_ggplot2) |> 
+  config(locale = 'es')
+```
+
+
+
+# Modelo con clima futuro
+
+```{r}
+#| label: modelo futuro
+#| message: false
+#| warning: false
+
+# Convertir variables climáticas futuras al formato raster stack
+clima_futuro_raster <- raster::stack(clima_futuro)
+
+# Asegurar que las variables tengan los mismos nombres y orden
+names(clima_futuro_raster) <- names(clima_actual)
+
+# Proyectar el modelo al clima futuro
+prediccion_futuro <- predict(modelo_actual, clima_futuro_raster)
+```
+
+# Cálculo de la diferencia entre modelos
+
+```{r}
+#| label: diferencia
+#| message: false
+#| warning: false
+
+# Calcular la diferencia
+diferencia <- prediccion_futuro - prediccion_actual
+```
+
+
+# Mapa interactivo de clima futuro y actual con la idoneidad de nicho de la especie Rhinoderma darwinii
+
+```{r}
+#| label: mapa1
+#| message: false
+#| warning: false
+
+# Paleta de colores del modelo con clima actual
+colores_modelo_actual <- colorNumeric(
+  palette = c("white", "black"),
+  values(prediccion_actual),
+  na.color = "transparent"
+)
+
+# Paleta de colores del modelo con clima futuro
+colores_modelo_futuro <- colorNumeric(
+  palette = c("white", "black"),
+  values(prediccion_futuro),
+  na.color = "transparent"
+)
+
+# Crear paleta de colores para la diferencia
+paleta_diferencia <- colorNumeric(
+  palette = c("red", "white", "blue"),
+  domain = c(min(values(diferencia), na.rm = TRUE), max(values(diferencia), na.rm = TRUE)),
+  na.color = "transparent"
+)
+
+# Mapa de la diferencia
+leaflet() |>
+  addTiles(group = "Mapa general") |>
+  addProviderTiles(
+    providers$Esri.WorldImagery, 
+    group = "Imágenes satelitales"
+  ) |>  
+  addProviderTiles(
+    providers$CartoDB.Positron, 
+    group = "Mapa blanco"
+  ) |>
+  addRasterImage(
+    prediccion_actual,
+    colors = colores_modelo_actual,
+    opacity = 0.6,
+    group = "Modelo con clima actual",
+  ) |>
+  addRasterImage(
+    prediccion_futuro,
+    colors = colores_modelo_futuro,
+    opacity = 0.6,
+    group = "Modelo con clima futuro",
+  ) |>  
+  addRasterImage(
+    diferencia,
+    colors = paleta_diferencia,
+    opacity = 0.6,
+    group = "Diferencia",
+  ) |>  
+  addLegend(
+    title = "Modelo con clima actual",
+    values = values(prediccion_actual),
+    pal = colores_modelo_actual,
+    position = "bottomright",
+    group = "Modelo con clima actual"
+  ) |>    
+  addLegend(
+    title = "Modelo con clima futuro",
+    values = values(prediccion_futuro),
+    pal = colores_modelo_futuro,
+    position = "bottomright",
+    group = "Modelo con clima futuro"
+  ) |>     
+  addLegend(
+    title = "Diferencia",
+    values = values(diferencia),
+    pal = paleta_diferencia,
+    position = "bottomleft",
+    group = "Diferencia"
+  ) |>  
+  addLayersControl(
+    # control de capas
+    baseGroups = c("Mapa general", "Imágenes satelitales", "Mapa blanco"),
+    overlayGroups = c(
+      "Modelo con clima actual",
+      "Modelo con clima futuro",
+      "Diferencia"
+    )
+  ) |>
+  hideGroup("Modelo con clima actual") |>
+  hideGroup("Modelo con clima futuro")
+```
+
+# Mapar binario de la presencia de la especie Rhinoderma darwinii
+```{r}
+#| label: mapa2
+#| warning: false
+#| message: false
+
+# Definir el umbral
+umbral <- 0.5
+
+# Crear el raster binario ()
+prediccion_binaria_diferencia <- (diferencia >= umbral) * 1
+
+prediccion_binaria_actual <- (prediccion_actual >= umbral) * 1
+
+prediccion_binaria_futuro <- (prediccion_futuro >= umbral) * 1
+
+# Crear la paleta de colores para el raster binario de la diferencia
+colores_prediccion_binaria_diferencia <- colorFactor(
+  palette = c("transparent", "blue"),  # "transparent" para las áreas no adecuadas
+  domain = c(0, 1),
+  na.color = "transparent"
+)
+
+# Crear la paleta de colores para el raster binario actual
+colores_prediccion_binaria_actual <- colorFactor(
+  palette = c("transparent", "blue"),  # "transparent" para las áreas no adecuadas
+  domain = c(0, 1),
+  na.color = "transparent"
+)
+
+# Crear la paleta de colores para el raster binario futuro
+colores_prediccion_binaria_futuro <- colorFactor(
+  palette = c("transparent", "blue"),  # "transparent" para las áreas no adecuadas
+  domain = c(0, 1),
+  na.color = "transparent"
+)
+
+# Mapa
+leaflet() |>
+  addTiles(group = "Mapa general") |>
+  addProviderTiles(
+    providers$Esri.WorldImagery, 
+    group = "Imágenes satelitales"
+  ) |>
+  addProviderTiles(
+    providers$CartoDB.Positron, 
+    group = "Mapa blanco"
+  ) |>
+  addRasterImage(
+    prediccion_binaria_diferencia,
+    colors = colores_prediccion_binaria_diferencia,
+    opacity = 0.6,
+    group = "Modelo de distribución binario de la diferencia",
+  ) |>
+  addRasterImage(
+    prediccion_binaria_actual,
+    colors = colores_prediccion_binaria_actual,
+    opacity = 0.6,
+    group = "Modelo de distribución binario actual",
+  ) |>
+  addRasterImage(
+    prediccion_binaria_futuro,
+    colors = colores_prediccion_binaria_futuro,
+    opacity = 0.6,
+    group = "Modelo de distribución binario futuro",
+  ) |>
+  addCircleMarkers(
+    data = presencia,
+    stroke = FALSE,
+    radius = 3,
+    fillColor = 'red',
+    fillOpacity = 1,
+    popup = paste(
+      paste0("<strong>País: </strong>", presencia$country),
+      paste0("<strong>Localidad: </strong>", presencia$locality),
+      paste0("<strong>Fecha: </strong>", presencia$eventDate),
+      paste0("<strong>Fuente: </strong>", presencia$institutionCode),
+      paste0("<a href='", presencia$occurrenceID, "'>Más información</a>"),
+      sep = '<br/>'
+    ),
+    group = "Registros de Ateles geoffroyi"
+  ) |>
+  addLegend(
+    title = "Modelo de distribución binario de la diferencia",
+    labels = c("Ausencia", "Presencia"),
+    colors = c("transparent", "blue"),
+    position = "bottomright",
+    group = "Modelo de distribución binario de la diferencia"
+  ) |>
+  addLegend(
+    title = "Modelo de distribución binario actual",
+    labels = c("Ausencia", "Presencia"),
+    colors = c("transparent", "blue"),
+    position = "bottomright",
+    group = "Modelo de distribución binario actual"
+  ) |>
+  addLegend(
+    title = "Modelo de distribución binario futuro",
+    labels = c("Ausencia", "Presencia"),
+    colors = c("transparent", "blue"),
+    position = "bottomright",
+    group = "Modelo de distribución binario futuro"
+  ) |>
+  addLayersControl(
+    baseGroups = c("Mapa general", "Imágenes satelitales", "Mapa blanco"),
+    overlayGroups = c(
+      "Modelo de distribución binario de la diferencia",
+      "Modelo de distribución binario actual",
+      "Modelo de distribución binario futuro",
+      "Registros de Ateles geoffroyi"
+    )
+  ) |>
+  hideGroup("Modelo de distribución binario actual") |>
+  hideGroup("Modelo de distribución binario futuro")
+```
+## Comentario Final 
+
+De acuerdo a los mapas observados la especie Rhinoderma darwinii se verá muy afectada por el cambio climático. En ambos mapas interactivos se puede ver como su distribución varía desde el escenario actual hacia el futuro, provocando una migración del nicho de la especie hacia regiones más frías al sur de Chile y cerca de fuentes de agua. En el mapa binario se ve presencia de la especie en una sola región de chile muy pequeña perteneciente al Parque Nacional Isla Magdalena y Ausencia de la especie en Argentina.
